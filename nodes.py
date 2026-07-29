@@ -77,12 +77,34 @@ def _decode_audio_via_ffmpeg(path: str, sample_rate: int = HIGGS_SAMPLE_RATE):
     return waveform, sample_rate
 
 
+def _download(url: str, dest_path: str) -> None:
+    """
+    Download a URL to a local path with a browser-like User-Agent.
+
+    urllib's default User-Agent ("Python-urllib/x.y") gets a 403 from at
+    least docs.boson.ai's WAF (confirmed testing this node) -- a real risk
+    for any arbitrary user-supplied custom_audio_url too, not just the
+    preset clips.
+    """
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as resp, open(dest_path, "wb") as f:
+        f.write(resp.read())
+
+
 class HiggsV3VoicePreset:
     """
-    Loads one of six named Higgs v3 demo voices as AUDIO for HiggsV3VoiceClone's
-    reference_audio input. Reads the concept_mapping-staged local copy if present;
-    falls back to downloading directly, since concept_mapping is not guaranteed
-    to persist across Graydient machine classes.
+    Loads a reference voice as AUDIO for HiggsV3VoiceClone's reference_audio
+    input -- either one of six named Higgs v3 demo voices, or an arbitrary
+    user-supplied audio URL via custom_audio_url (takes priority over voice
+    when non-empty, same pattern as BakeVertexColorsFromViews's back_image_url
+    in ComfyUI-TripoSG).
+
+    Preset clips read the concept_mapping-staged local copy if present; fall
+    back to downloading directly, since concept_mapping is not guaranteed to
+    persist across Graydient machine classes. custom_audio_url always
+    downloads fresh (it's per-job, not worth pre-staging).
     """
 
     @classmethod
@@ -90,6 +112,7 @@ class HiggsV3VoicePreset:
         return {
             "required": {
                 "voice": (list(VOICE_PRESETS.keys()), {"default": "jake"}),
+                "custom_audio_url": ("STRING", {"default": ""}),
             }
         }
 
@@ -98,16 +121,27 @@ class HiggsV3VoicePreset:
     FUNCTION = "load"
     CATEGORY = "Higgs v3 TTS"
 
-    def load(self, voice):
+    def load(self, voice, custom_audio_url=""):
+        custom_audio_url = (custom_audio_url or "").strip()
+
+        if custom_audio_url:
+            import tempfile
+
+            suffix = os.path.splitext(custom_audio_url.split("?")[0])[1] or ".audio"
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            os.close(fd)
+            _download(custom_audio_url, tmp_path)
+            waveform, sample_rate = _decode_audio_via_ffmpeg(tmp_path)
+            return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
+
         import folder_paths
 
         filename, _description = VOICE_PRESETS[voice]
         local_path = os.path.join(folder_paths.models_dir, "higgsv3tts", "voices", filename)
 
         if not os.path.isfile(local_path):
-            import urllib.request
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            urllib.request.urlretrieve(f"{VOICE_SAMPLE_BASE_URL}/{filename}", local_path)
+            _download(f"{VOICE_SAMPLE_BASE_URL}/{filename}", local_path)
 
         waveform, sample_rate = _decode_audio_via_ffmpeg(local_path)
         return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
