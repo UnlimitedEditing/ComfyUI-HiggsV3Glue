@@ -1,4 +1,5 @@
 import os
+import re
 
 VOICE_PRESETS = {
     "jake": (
@@ -147,10 +148,56 @@ class HiggsV3VoicePreset:
         return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
 
 
+class HiggsV3TagBuilder:
+    """
+    Prepends Higgs v3 control tags to text WITHOUT the caller ever typing a
+    literal '<' or '>' character.
+
+    Exists because the Telegram/Graydient chat frontend used to submit these
+    jobs mangles bare '<...>' in message text before it reaches the workflow
+    (confirmed live 2026-07-29 -- <|emotion:sad|> came out as the model
+    literally saying the words "emotion sad", meaning the frontend stripped
+    the tag delimiters and left literal leftover text). `tags` takes plain
+    "key:value" pairs (no brackets) -- e.g. "emotion:sad;style:whispering" --
+    and this node adds the <|...|> wrapper itself, server-side, so the
+    angle brackets never pass through chat as raw characters.
+
+    Tags are sentence-level only (Higgs v3's own style/emotion tags must sit
+    at the start of the sentence they affect per the model card) -- this
+    node always prepends, it doesn't support positioning a tag mid-sentence.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True, "default": "Hello! This is Higgs Audio v3 running natively inside ComfyUI."}),
+                "tags": ("STRING", {"default": "", "tooltip": "Bracket-free tag list, e.g. emotion:sad;style:whispering -- semicolon or comma separated, no < > needed"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("combined_text",)
+    FUNCTION = "build"
+    CATEGORY = "Higgs v3 TTS"
+
+    def build(self, text, tags=""):
+        tags = (tags or "").strip()
+        prefix = ""
+        if tags:
+            for raw in re.split(r"[;,]", tags):
+                raw = raw.strip().strip("<|>").strip()
+                if raw:
+                    prefix += f"<|{raw}|>"
+        return (prefix + text,)
+
+
 NODE_CLASS_MAPPINGS = {
     "HiggsV3VoicePreset": HiggsV3VoicePreset,
+    "HiggsV3TagBuilder": HiggsV3TagBuilder,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "HiggsV3VoicePreset": "Higgs v3 Voice Preset",
+    "HiggsV3TagBuilder": "Higgs v3 Tag Builder",
 }
