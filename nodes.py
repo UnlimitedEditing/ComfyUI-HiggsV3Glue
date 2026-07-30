@@ -183,13 +183,33 @@ class HiggsV3TagBuilder:
 
     def build(self, text, tags=""):
         tags = (tags or "").strip()
+        working_text = text
+
+        # Fallback path: fold tags into the single `text`/prompt field using a
+        # "tags::speech" marker, since `negative_prompt` -> `tags` has proven
+        # unreliable in practice (confirmed live 2026-07-29: negative_prompt is
+        # a real, fillable field in the chat UI, but tags placed there never
+        # affected output across repeated tests -- root cause unconfirmed,
+        # likely a Graydient-side quirk specific to that field for
+        # supports_txt2wav workflows). `prompt` has been reliable in every
+        # test, so this keeps both paths live: whichever one actually works,
+        # works. Only treated as a marker if `tags` is empty (negative_prompt
+        # didn't supply anything) and the part before '::' looks like tag
+        # syntax, not just a sentence that happens to contain '::'.
+        if not tags and "::" in text:
+            marker_part, _, rest = text.partition("::")
+            marker_part = marker_part.strip()
+            if marker_part and len(marker_part) < 200 and ":" in marker_part:
+                tags = marker_part
+                working_text = rest.strip()
+
         prefix = ""
         if tags:
             for raw in re.split(r"[;,]", tags):
                 raw = raw.strip().strip("<|>").strip()
                 if raw:
                     prefix += f"<|{raw}|>"
-        return (prefix + text,)
+        return (prefix + working_text,)
 
 
 NODE_CLASS_MAPPINGS = {
