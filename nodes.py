@@ -89,6 +89,24 @@ def _download(url: str, dest_path: str) -> None:
     """
     import urllib.request
 
+    if not (url.startswith("http://") or url.startswith("https://")):
+        # Confirmed live 2026-08-01: a Telegram voice-message reply produced
+        # a mangled non-URL value here (every ':'/'/'/'_' stripped, e.g.
+        # "init_audio__httpsapi.telegram.org...oga") instead of a real
+        # fetchable URL. Graydient has no upload endpoint of its own (per
+        # graydient-cli's docs) -- local/internal file references must be
+        # uploaded to a real public URL *before* being passed as init_audio;
+        # this value looks like whatever produced it skipped that step. Fail
+        # clearly here instead of a raw urllib traceback, since the real fix
+        # is upstream (the submitting client), not in this node.
+        raise ValueError(
+            f"custom_audio_url/init_audio is not a valid http(s) URL: {url!r}. "
+            "This usually means the submitting client passed a raw/internal file "
+            "reference (e.g. an un-uploaded Telegram voice-message attachment) "
+            "instead of uploading it to a public URL first -- Graydient has no "
+            "upload endpoint of its own, so this can't be resolved server-side."
+        )
+
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req) as resp, open(dest_path, "wb") as f:
         f.write(resp.read())
