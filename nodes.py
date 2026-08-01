@@ -128,24 +128,31 @@ class HiggsV3VoicePreset:
         if custom_audio_url:
             import tempfile
 
+            print(f"[HiggsV3VoicePreset] voice={voice!r} custom_audio_url={custom_audio_url!r} -> source='custom_audio_url'")
             suffix = os.path.splitext(custom_audio_url.split("?")[0])[1] or ".audio"
             fd, tmp_path = tempfile.mkstemp(suffix=suffix)
             os.close(fd)
             _download(custom_audio_url, tmp_path)
             waveform, sample_rate = _decode_audio_via_ffmpeg(tmp_path)
+            print(f"[HiggsV3VoicePreset] loaded custom clip: shape={tuple(waveform.shape)} sample_rate={sample_rate}")
             return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
 
         import folder_paths
 
         filename, _description = VOICE_PRESETS[voice]
         local_path = os.path.join(folder_paths.models_dir, "higgsv3tts", "voices", filename)
+        print(f"[HiggsV3VoicePreset] voice={voice!r} custom_audio_url='' -> source='preset' file={local_path!r}")
 
         if not os.path.isfile(local_path):
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             _download(f"{VOICE_SAMPLE_BASE_URL}/{filename}", local_path)
 
         waveform, sample_rate = _decode_audio_via_ffmpeg(local_path)
+        print(f"[HiggsV3VoicePreset] loaded preset clip: shape={tuple(waveform.shape)} sample_rate={sample_rate}")
         return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
+
+
+_BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
 
 
 class HiggsV3TagBuilder:
@@ -153,18 +160,38 @@ class HiggsV3TagBuilder:
     Prepends Higgs v3 control tags to text WITHOUT the caller ever typing a
     literal '<' or '>' character.
 
-    Exists because the Telegram/Graydient chat frontend used to submit these
-    jobs mangles bare '<...>' in message text before it reaches the workflow
-    (confirmed live 2026-07-29 -- <|emotion:sad|> came out as the model
-    literally saying the words "emotion sad", meaning the frontend stripped
-    the tag delimiters and left literal leftover text). `tags` takes plain
-    "key:value" pairs (no brackets) -- e.g. "emotion:sad;style:whispering" --
-    and this node adds the <|...|> wrapper itself, server-side, so the
-    angle brackets never pass through chat as raw characters.
+    Background: the Telegram/Graydient chat frontend mangles bare '<...>' in
+    message text before it reaches the workflow (confirmed live 2026-07-29 --
+    <|emotion:sad|> came out as the model literally saying the words "emotion
+    sad", meaning the frontend stripped the tag delimiters and left literal
+    leftover text).
+
+    Three ways to supply tags, tried in this priority order:
+      1. `tags` input, if non-empty (bracket-free "key:value" list, e.g.
+         "emotion:sad;style:whispering"). Kept for completeness, but per
+         Graydient's own API response for this workflow, a `local_field:
+         "prompt_positive"` entry gets auto-synthesized (not something we
+         configured -- likely triggered by `split_prompt_pos_neg: true`) that
+         targets the SAME node input slot as `tags` and silently overwrites
+         it -- confirmed 2026-07-29 via `graydient workflows show`. Don't
+         assume this path is live; verify against a fresh `workflows show`
+         if depending on it.
+      2. `[...]` square-bracket groups found anywhere in `text` -- this is
+         Graydient's actual native negative-prompt syntax (confirmed via the
+         graydient-cli docs: "there's no separate negative field over the raw
+         API ... applied inline in the same string"). Each group's inner
+         content is extracted, the group is removed from the spoken text, and
+         multiple groups are joined with commas as the tag list.
+      3. A `tags::speech` marker at the start of `text` (own convention, not
+         a Graydient one) -- kept as a last-resort fallback.
 
     Tags are sentence-level only (Higgs v3's own style/emotion tags must sit
     at the start of the sentence they affect per the model card) -- this
     node always prepends, it doesn't support positioning a tag mid-sentence.
+
+    Logs every input/output to the ComfyUI console (visible in Graydient job
+    logs) so a failed run shows exactly what this node received and produced,
+    instead of requiring guesswork from the final spoken audio.
     """
 
     @classmethod
@@ -184,24 +211,22 @@ class HiggsV3TagBuilder:
     def build(self, text, tags=""):
         tags = (tags or "").strip()
         working_text = text
+        source = "tags input" if tags else None
 
-        # Fallback path: fold tags into the single `text`/prompt field using a
-        # "tags::speech" marker, since `negative_prompt` -> `tags` has proven
-        # unreliable in practice (confirmed live 2026-07-29: negative_prompt is
-        # a real, fillable field in the chat UI, but tags placed there never
-        # affected output across repeated tests -- root cause unconfirmed,
-        # likely a Graydient-side quirk specific to that field for
-        # supports_txt2wav workflows). `prompt` has been reliable in every
-        # test, so this keeps both paths live: whichever one actually works,
-        # works. Only treated as a marker if `tags` is empty (negative_prompt
-        # didn't supply anything) and the part before '::' looks like tag
-        # syntax, not just a sentence that happens to contain '::'.
-        if not tags and "::" in text:
-            marker_part, _, rest = text.partition("::")
+        if not tags:
+            bracket_matches = _BRACKET_RE.findall(text)
+            if bracket_matches:
+                tags = ",".join(m.strip() for m in bracket_matches if m.strip())
+                working_text = _BRACKET_RE.sub("", text).strip()
+                source = "[...] bracket groups in text"
+
+        if not tags and "::" in working_text:
+            marker_part, _, rest = working_text.partition("::")
             marker_part = marker_part.strip()
             if marker_part and len(marker_part) < 200 and ":" in marker_part:
                 tags = marker_part
                 working_text = rest.strip()
+                source = "tags::speech marker"
 
         prefix = ""
         if tags:
@@ -209,7 +234,14 @@ class HiggsV3TagBuilder:
                 raw = raw.strip().strip("<|>").strip()
                 if raw:
                     prefix += f"<|{raw}|>"
-        return (prefix + working_text,)
+
+        combined = prefix + working_text
+        print(
+            f"[HiggsV3TagBuilder] text={text!r} tags_input={tags if source == 'tags input' else ''!r} "
+            f"-> source={source!r} resolved_tags={tags!r} working_text={working_text!r} "
+            f"-> combined_text={combined!r}"
+        )
+        return (combined,)
 
 
 NODE_CLASS_MAPPINGS = {
