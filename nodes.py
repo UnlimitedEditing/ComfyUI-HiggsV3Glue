@@ -442,7 +442,32 @@ class HiggsV3TagBuilder:
                 if raw:
                     prefix += f"<|{raw}|>"
 
-        combined = prefix + working_text
+        if prefix:
+            # Tags go after the FIRST WORD, not before the whole utterance.
+            # Per the upstream maintainer (Saganaki22/Higgs_v3-TTS-ComfyUI
+            # issue #3, 2026-08-02 read): a control tag placed before any
+            # word of speech can overpower/override reference-audio speaker
+            # conditioning entirely, causing zero-shot cloning to drift onto
+            # an unrelated voice -- confirmed as the likely cause of a real
+            # clone-but-tagged job here that structurally cloned correctly
+            # (reference_audio linked, clip loaded and Whisper-transcribed
+            # fine) but still came out in a random voice. Maintainer's fix:
+            # "let the model establish the reference voice with at least one
+            # word first" -- tag placed directly after word 1 with NO space
+            # before the next word, e.g. "This <|emotion:sadness|>is a
+            # test." Splitting on the first whitespace run reproduces that
+            # shape automatically so callers keep typing "tags::speech" up
+            # front and don't need to know this rule.
+            parts = working_text.split(None, 1)
+            if len(parts) == 2:
+                first_word, rest = parts
+                combined = f"{first_word} {prefix}{rest}"
+            elif len(parts) == 1:
+                combined = f"{parts[0]} {prefix}".rstrip()
+            else:
+                combined = prefix
+        else:
+            combined = working_text
         print(
             f"[HiggsV3TagBuilder] text={text!r} ignored_tags_input={ignored_tags_input!r} "
             f"-> source={source!r} resolved_tags={tags!r} working_text={working_text!r} "
