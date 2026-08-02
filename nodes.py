@@ -145,18 +145,82 @@ def _download(url: str, dest_path: str) -> None:
         f.write(resp.read())
 
 
+def _resolve_reference_audio(value: str, source_label: str):
+    """
+    Load a reference clip from an arbitrary Graydient-supplied string, which
+    might be a real URL, a mangled Telegram file reference, or a bare local
+    filename/path -- we don't control which shape the submitting client uses,
+    so try each in turn rather than assuming one.
+    """
+    import tempfile
+
+    value = value.strip()
+
+    if value.startswith("http://") or value.startswith("https://"):
+        print(f"[HiggsV3VoicePreset] {source_label}={value!r} -> treating as URL")
+        suffix = os.path.splitext(value.split("?")[0])[1] or ".audio"
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        _download(value, tmp_path)
+        return _decode_audio_via_ffmpeg(tmp_path)
+
+    reconstructed = _unmangle_telegram_file_url(value)
+    if reconstructed is not None:
+        print(f"[HiggsV3VoicePreset] {source_label}={value!r} -> reconstructed mangled Telegram URL {reconstructed!r}")
+        suffix = os.path.splitext(reconstructed.split("?")[0])[1] or ".audio"
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        _download(reconstructed, tmp_path)
+        return _decode_audio_via_ffmpeg(tmp_path)
+
+    # Not a URL and not a reconstructable Telegram reference -- try it as a
+    # bare local filename/path. Check ComfyUI's own input/ directory (where
+    # an already-uploaded-to-Graydient file would plausibly land) as well as
+    # the literal path as given.
+    candidates = [value]
+    try:
+        import folder_paths
+        candidates.append(os.path.join(folder_paths.get_input_directory(), value))
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            print(f"[HiggsV3VoicePreset] {source_label}={value!r} -> found local file {candidate!r}")
+            return _decode_audio_via_ffmpeg(candidate)
+
+    raise ValueError(
+        f"{source_label}={value!r} is not a valid http(s) URL, a reconstructable "
+        "Telegram file reference, or an existing local file (checked ComfyUI's "
+        f"input/ directory and the literal value). Tried: {candidates!r}"
+    )
+
+
 class HiggsV3VoicePreset:
     """
     Loads a reference voice as AUDIO for HiggsV3VoiceClone's reference_audio
-    input -- either one of six named Higgs v3 demo voices, or an arbitrary
-    user-supplied audio URL via custom_audio_url (takes priority over voice
-    when non-empty, same pattern as BakeVertexColorsFromViews's back_image_url
-    in ComfyUI-TripoSG).
+    input -- either one of six named Higgs v3 demo voices, or a user-supplied
+    reference clip, same pattern as BakeVertexColorsFromViews's
+    back_image_url in ComfyUI-TripoSG.
+
+    Three separate custom-clip inputs exist because it's unclear which field
+    name a given Graydient submission path (chat frontend vs CLI vs pasted
+    URL vs file attachment) actually populates -- this project's own
+    established convention for images is "init_image_url" (with a "_url"
+    suffix), which is a *different* literal string than the raw API body key
+    ("init_image", no suffix) graydient-cli uses. Confirmed live 2026-08-02
+    that "init_audio" (matching the raw body key) does work via both the CLI
+    and a real chat-frontend attachment flow, but that doesn't rule out other
+    input paths using "init_audio_url" or "init_audio_filename" instead --
+    mapping all three to separate slots costs nothing and avoids silently
+    dropping whichever one Graydient actually happens to populate for a given
+    submission method. Checked in order: custom_audio_url, then
+    custom_audio_url_alt, then custom_audio_filename; first non-empty wins.
 
     Preset clips read the concept_mapping-staged local copy if present; fall
     back to downloading directly, since concept_mapping is not guaranteed to
-    persist across Graydient machine classes. custom_audio_url always
-    downloads fresh (it's per-job, not worth pre-staging).
+    persist across Graydient machine classes. Custom clips always resolve
+    fresh (they're per-job, not worth pre-staging).
     """
 
     @classmethod
@@ -165,6 +229,8 @@ class HiggsV3VoicePreset:
             "required": {
                 "voice": (list(VOICE_PRESETS.keys()), {"default": "jake"}),
                 "custom_audio_url": ("STRING", {"default": ""}),
+                "custom_audio_url_alt": ("STRING", {"default": ""}),
+                "custom_audio_filename": ("STRING", {"default": ""}),
             }
         }
 
@@ -173,26 +239,24 @@ class HiggsV3VoicePreset:
     FUNCTION = "load"
     CATEGORY = "Higgs v3 TTS"
 
-    def load(self, voice, custom_audio_url=""):
-        custom_audio_url = (custom_audio_url or "").strip()
-
-        if custom_audio_url:
-            import tempfile
-
-            print(f"[HiggsV3VoicePreset] voice={voice!r} custom_audio_url={custom_audio_url!r} -> source='custom_audio_url'")
-            suffix = os.path.splitext(custom_audio_url.split("?")[0])[1] or ".audio"
-            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-            os.close(fd)
-            _download(custom_audio_url, tmp_path)
-            waveform, sample_rate = _decode_audio_via_ffmpeg(tmp_path)
-            print(f"[HiggsV3VoicePreset] loaded custom clip: shape={tuple(waveform.shape)} sample_rate={sample_rate}")
+    def load(self, voice, custom_audio_url="", custom_audio_url_alt="", custom_audio_filename=""):
+        for value, label in (
+            (custom_audio_url, "custom_audio_url"),
+            (custom_audio_url_alt, "custom_audio_url_alt"),
+            (custom_audio_filename, "custom_audio_filename"),
+        ):
+            value = (value or "").strip()
+            if not value:
+                continue
+            waveform, sample_rate = _resolve_reference_audio(value, label)
+            print(f"[HiggsV3VoicePreset] loaded custom clip via {label}: shape={tuple(waveform.shape)} sample_rate={sample_rate}")
             return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
 
         import folder_paths
 
         filename, _description = VOICE_PRESETS[voice]
         local_path = os.path.join(folder_paths.models_dir, "higgsv3tts", "voices", filename)
-        print(f"[HiggsV3VoicePreset] voice={voice!r} custom_audio_url='' -> source='preset' file={local_path!r}")
+        print(f"[HiggsV3VoicePreset] voice={voice!r}, no custom clip supplied -> source='preset' file={local_path!r}")
 
         if not os.path.isfile(local_path):
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
