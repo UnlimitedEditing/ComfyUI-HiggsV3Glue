@@ -41,6 +41,54 @@ VOICE_PRESETS = {
 VOICE_SAMPLE_BASE_URL = "https://docs.boson.ai/public/audio/higgs-audio-tts-voices"
 
 HIGGS_SAMPLE_RATE = 24000
+# Matches HiggsV3VoiceClone's own trim_silence_edges() threshold (native.py,
+# Saganaki22/Higgs_v3-TTS-ComfyUI) -- logging against the same threshold they
+# actually use, not a guessed one, so this diagnostic is directly comparable
+# to what their trimming will do to this exact clip.
+SILENCE_THRESHOLD_DB = -42.0
+
+
+def _audio_stats(waveform, sample_rate: int) -> str:
+    """
+    Signal-level diagnostics for a reference clip, logged to the ComfyUI
+    console. Added 2026-08-02 after a real clone attempt produced no
+    audible cloning despite the pipeline running error-free end to end --
+    source-code review of HiggsV3VoiceClone confirmed reference_audio is
+    structurally used for conditioning in our pipeline (never silently
+    skipped, since our AUDIO dict is never None), so if cloning still isn't
+    audible, these numbers are the next thing to check: a clip that's mostly
+    below Saganaki's own -42dB trim threshold, unusually short after
+    trimming, or clipped/near-silent overall would explain weak cloning at
+    the model level rather than a wiring bug.
+    """
+    import math
+    import torch
+
+    flat = waveform.reshape(-1).float()
+    n = flat.numel()
+    if n == 0:
+        return "EMPTY (0 samples)"
+
+    def _to_db(x: float) -> float:
+        return 20.0 * math.log10(x) if x > 1e-12 else float("-inf")
+
+    peak_db = _to_db(flat.abs().max().item())
+    rms_db = _to_db(flat.pow(2).mean().sqrt().item())
+    duration = n / sample_rate
+
+    frame = max(1, int(sample_rate * 0.01))  # 10ms frames, matching trim_silence_edges
+    n_frames = (n + frame - 1) // frame
+    quiet_frames = 0
+    for i in range(n_frames):
+        seg = flat[i * frame:(i + 1) * frame]
+        if seg.numel() and _to_db(seg.pow(2).mean().sqrt().item()) < SILENCE_THRESHOLD_DB:
+            quiet_frames += 1
+    quiet_pct = 100.0 * quiet_frames / max(1, n_frames)
+
+    return (
+        f"duration={duration:.2f}s peak={peak_db:.1f}dBFS rms={rms_db:.1f}dBFS "
+        f"frames_below_{SILENCE_THRESHOLD_DB:.0f}dB={quiet_pct:.0f}%"
+    )
 
 
 def _decode_audio_via_ffmpeg(path: str, sample_rate: int = HIGGS_SAMPLE_RATE):
@@ -249,7 +297,11 @@ class HiggsV3VoicePreset:
             if not value:
                 continue
             waveform, sample_rate = _resolve_reference_audio(value, label)
-            print(f"[HiggsV3VoicePreset] loaded custom clip via {label}: shape={tuple(waveform.shape)} sample_rate={sample_rate}")
+            print(
+                f"[HiggsV3VoicePreset] loaded custom clip via {label}: "
+                f"shape={tuple(waveform.shape)} sample_rate={sample_rate} "
+                f"stats=({_audio_stats(waveform, sample_rate)})"
+            )
             return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
 
         import folder_paths
@@ -263,7 +315,10 @@ class HiggsV3VoicePreset:
             _download(f"{VOICE_SAMPLE_BASE_URL}/{filename}", local_path)
 
         waveform, sample_rate = _decode_audio_via_ffmpeg(local_path)
-        print(f"[HiggsV3VoicePreset] loaded preset clip: shape={tuple(waveform.shape)} sample_rate={sample_rate}")
+        print(
+            f"[HiggsV3VoicePreset] loaded preset clip: shape={tuple(waveform.shape)} "
+            f"sample_rate={sample_rate} stats=({_audio_stats(waveform, sample_rate)})"
+        )
         return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
 
 
