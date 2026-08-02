@@ -78,6 +78,35 @@ def _decode_audio_via_ffmpeg(path: str, sample_rate: int = HIGGS_SAMPLE_RATE):
     return waveform, sample_rate
 
 
+_MANGLED_TELEGRAM_FILE_RE = re.compile(
+    r'^(?:[a-z_]+__)?(https?)api\.telegram\.orgfilebot(\d+)([A-Za-z0-9_-]+?)'
+    r'(voice|photo|video_note|video|audio|document|animation|sticker)file(\d+)\.([a-z0-9]+)$',
+    re.IGNORECASE,
+)
+
+
+def _unmangle_telegram_file_url(value: str):
+    """
+    Reconstruct a real Telegram Bot API file URL from the mangled,
+    delimiter-stripped form Graydient produces for an un-uploaded voice/photo
+    message reply -- confirmed live 2026-08-01, e.g.
+    "init_audio__httpsapi.telegram.orgfilebot5714594430AAFo...voicefile2033054.oga"
+    for the real URL
+    "https://api.telegram.org/file/bot5714594430:AAFo.../voice/file_2033054.oga".
+
+    This is deliberately narrow: it only recognizes this one well-known,
+    fixed URL shape (Telegram's Bot API file-download convention), not a
+    general "guess any mangled URL" heuristic -- the mangling is lossy for
+    arbitrary URLs and can't be reversed in general. Returns None if `value`
+    doesn't match this specific pattern.
+    """
+    m = _MANGLED_TELEGRAM_FILE_RE.match(value)
+    if not m:
+        return None
+    scheme, bot_id, bot_secret, media_kind, file_id, ext = m.groups()
+    return f"{scheme}://api.telegram.org/file/bot{bot_id}:{bot_secret}/{media_kind}/file_{file_id}.{ext}"
+
+
 def _download(url: str, dest_path: str) -> None:
     """
     Download a URL to a local path with a browser-like User-Agent.
@@ -93,19 +122,23 @@ def _download(url: str, dest_path: str) -> None:
         # Confirmed live 2026-08-01: a Telegram voice-message reply produced
         # a mangled non-URL value here (every ':'/'/'/'_' stripped, e.g.
         # "init_audio__httpsapi.telegram.org...oga") instead of a real
-        # fetchable URL. Graydient has no upload endpoint of its own (per
-        # graydient-cli's docs) -- local/internal file references must be
-        # uploaded to a real public URL *before* being passed as init_audio;
-        # this value looks like whatever produced it skipped that step. Fail
-        # clearly here instead of a raw urllib traceback, since the real fix
-        # is upstream (the submitting client), not in this node.
-        raise ValueError(
-            f"custom_audio_url/init_audio is not a valid http(s) URL: {url!r}. "
-            "This usually means the submitting client passed a raw/internal file "
-            "reference (e.g. an un-uploaded Telegram voice-message attachment) "
-            "instead of uploading it to a public URL first -- Graydient has no "
-            "upload endpoint of its own, so this can't be resolved server-side."
-        )
+        # fetchable URL -- Graydient has no upload endpoint of its own, so
+        # whatever submitted this skipped uploading the attachment first.
+        # Try to reconstruct the real Telegram file URL from the known
+        # mangled shape before giving up.
+        reconstructed = _unmangle_telegram_file_url(url)
+        if reconstructed is None:
+            raise ValueError(
+                f"custom_audio_url/init_audio is not a valid http(s) URL: {url!r}. "
+                "This usually means the submitting client passed a raw/internal "
+                "file reference (e.g. an un-uploaded Telegram voice-message "
+                "attachment) instead of uploading it to a public URL first -- "
+                "Graydient has no upload endpoint of its own, so this can't be "
+                "resolved server-side, and it didn't match the known Telegram "
+                "file-URL mangling pattern this node can reconstruct."
+            )
+        print(f"[HiggsV3VoicePreset] reconstructed mangled Telegram file URL: {url!r} -> {reconstructed!r}")
+        url = reconstructed
 
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req) as resp, open(dest_path, "wb") as f:
