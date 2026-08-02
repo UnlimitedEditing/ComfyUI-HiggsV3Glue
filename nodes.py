@@ -279,6 +279,16 @@ class HiggsV3VoicePreset:
                 "custom_audio_url": ("STRING", {"default": ""}),
                 "custom_audio_url_alt": ("STRING", {"default": ""}),
                 "custom_audio_filename": ("STRING", {"default": ""}),
+                "require_clone_source": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "If true, fail loudly when none of the three custom_audio_* "
+                        "inputs resolved to a clip, instead of silently falling back "
+                        "to the named voice preset. For when you need certainty that "
+                        "a clone source was actually used, not just that the job "
+                        "succeeded."
+                    ),
+                }),
             }
         }
 
@@ -287,7 +297,7 @@ class HiggsV3VoicePreset:
     FUNCTION = "load"
     CATEGORY = "Higgs v3 TTS"
 
-    def load(self, voice, custom_audio_url="", custom_audio_url_alt="", custom_audio_filename=""):
+    def load(self, voice, custom_audio_url="", custom_audio_url_alt="", custom_audio_filename="", require_clone_source=False):
         for value, label in (
             (custom_audio_url, "custom_audio_url"),
             (custom_audio_url_alt, "custom_audio_url_alt"),
@@ -303,6 +313,14 @@ class HiggsV3VoicePreset:
                 f"stats=({_audio_stats(waveform, sample_rate)})"
             )
             return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
+
+        if require_clone_source:
+            raise ValueError(
+                "require_clone_source is true, but none of custom_audio_url / "
+                "custom_audio_url_alt / custom_audio_filename resolved to a clip "
+                "(all empty). Refusing to silently fall back to the voice preset -- "
+                "either supply a clone source or set require_clone_source to false."
+            )
 
         import folder_paths
 
