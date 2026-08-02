@@ -352,6 +352,47 @@ class HiggsV3VoicePreset:
 
 _BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
 
+# Matches a "::tags::" marker ANYWHERE in the text (not just at the start),
+# used to split a message into multiple tag/speech segments -- e.g.
+# "emotion:happy:: Hi there! ::emotion:sad:: Goodbye now." The FIRST segment's
+# tags have no leading "::" (nothing precedes them to delimit against); every
+# segment after that needs both a leading and trailing "::" so the parser can
+# tell "a new tag block starts here" apart from an em-dash-style "::" a user
+# might type as punctuation. Captured content deliberately allows single ':'
+# characters (tags themselves look like "emotion:sadness,style:whispering" --
+# excluding ':' from the capture, an earlier version of this regex, meant it
+# could never match real tag content at all). Non-greedy so it stops at the
+# NEAREST following "::", not the last one in the message.
+_INLINE_MARKER_RE = re.compile(r"::(.+?)::")
+
+
+def _tags_to_prefix(tags: str) -> str:
+    prefix = ""
+    for raw in re.split(r"[;,]", tags):
+        raw = raw.strip().strip("<|>").strip()
+        if raw:
+            prefix += f"<|{raw}|>"
+    return prefix
+
+
+def _apply_tags_after_first_word(tags: str, speech_text: str) -> str:
+    """
+    Insert this segment's <|...|> tag prefix after the first word of
+    speech_text rather than before all of it -- see build()'s docstring for
+    why (Higgs v3 speaker-conditioning drift when a tag precedes every word
+    of the utterance). If speech_text has no tags, returned unchanged.
+    """
+    prefix = _tags_to_prefix(tags)
+    if not prefix:
+        return speech_text
+    parts = speech_text.split(None, 1)
+    if len(parts) == 2:
+        first_word, rest = parts
+        return f"{first_word} {prefix}{rest}"
+    if len(parts) == 1:
+        return f"{parts[0]} {prefix}".rstrip()
+    return prefix
+
 
 class HiggsV3TagBuilder:
     """
@@ -370,10 +411,22 @@ class HiggsV3TagBuilder:
          graydient-cli docs: "there's no separate negative field over the raw
          API ... applied inline in the same string"). Each group's inner
          content is extracted, the group is removed from the spoken text, and
-         multiple groups are joined with commas as the tag list.
-      2. A `tags::speech` marker at the start of `text` (own convention, not
-         a Graydient one) -- the confirmed-reliable path in real Graydient
-         testing.
+         multiple groups are joined with commas as ONE global tag list --
+         this path does not support multiple independently-tagged segments,
+         see (2) below for that.
+      2. `tags::speech` marker(s) (own convention, not a Graydient one) --
+         the confirmed-reliable path in real Graydient testing. Supports
+         MULTIPLE segments in one message, each with its own tags, confirmed
+         needed 2026-08-02 after a user tried putting a second tag block
+         mid-message and it came out spoken literally instead of applied:
+           `firsttag:thing:: speech ... ::secondtag:thing:: more speech ...`
+         The FIRST segment's tags have no leading `::` (nothing precedes them
+         to delimit against) -- just `tags:: speech`, same as before. Every
+         segment AFTER the first needs `::` on BOTH sides of its tag block --
+         `::tags::` -- so the parser can tell "a new tag block starts here"
+         apart from a literal `::` a user might type as punctuation
+         mid-sentence. A message with no `::` anywhere is left completely
+         untouched (plain speech, no tag processing at all).
 
     The `tags` external input (previously fed by `negative_prompt`) has been
     REMOVED as a tag source entirely -- confirmed live 2026-08-02 as a dead
@@ -417,61 +470,72 @@ class HiggsV3TagBuilder:
         # deliberately ignored -- see class docstring. text is always
         # checked for [...] / tags:: regardless.
         ignored_tags_input = (tags or "").strip()
-        tags = ""
         working_text = text
         source = None
+        segments_log = []
 
         bracket_matches = _BRACKET_RE.findall(text)
         if bracket_matches:
+            # Single global tag block applied to the whole message -- brackets
+            # don't support the multi-segment tags::speech::tags::speech...
+            # shape below, on purpose (this path isn't confirmed reliable
+            # through a real chat frontend anyway, see class docstring).
             tags = ",".join(m.strip() for m in bracket_matches if m.strip())
             working_text = _BRACKET_RE.sub("", text).strip()
             source = "[...] bracket groups in text"
+            combined = _apply_tags_after_first_word(tags, working_text)
+            segments_log.append((tags, working_text))
 
-        if not tags and "::" in working_text:
-            marker_part, _, rest = working_text.partition("::")
-            marker_part = marker_part.strip()
-            if marker_part and len(marker_part) < 200 and ":" in marker_part:
-                tags = marker_part
-                working_text = rest.strip()
-                source = "tags::speech marker"
+        elif "::" in working_text:
+            source = "tags::speech marker(s)"
 
-        prefix = ""
-        if tags:
-            for raw in re.split(r"[;,]", tags):
-                raw = raw.strip().strip("<|>").strip()
-                if raw:
-                    prefix += f"<|{raw}|>"
-
-        if prefix:
-            # Tags go after the FIRST WORD, not before the whole utterance.
-            # Per the upstream maintainer (Saganaki22/Higgs_v3-TTS-ComfyUI
-            # issue #3, 2026-08-02 read): a control tag placed before any
-            # word of speech can overpower/override reference-audio speaker
-            # conditioning entirely, causing zero-shot cloning to drift onto
-            # an unrelated voice -- confirmed as the likely cause of a real
-            # clone-but-tagged job here that structurally cloned correctly
-            # (reference_audio linked, clip loaded and Whisper-transcribed
-            # fine) but still came out in a random voice. Maintainer's fix:
-            # "let the model establish the reference voice with at least one
-            # word first" -- tag placed directly after word 1 with NO space
-            # before the next word, e.g. "This <|emotion:sadness|>is a
-            # test." Splitting on the first whitespace run reproduces that
-            # shape automatically so callers keep typing "tags::speech" up
-            # front and don't need to know this rule.
-            parts = working_text.split(None, 1)
-            if len(parts) == 2:
-                first_word, rest = parts
-                combined = f"{first_word} {prefix}{rest}"
-            elif len(parts) == 1:
-                combined = f"{parts[0]} {prefix}".rstrip()
+            # Leading segment: tags with NO leading "::" (nothing precedes
+            # them), terminated by the first "::". If what's before the
+            # first "::" doesn't look like a tag list (empty, too long, or
+            # no ":" in it), treat the whole message as segment text with no
+            # leading tags -- it might still contain later ::tags:: blocks.
+            head, _, rest = working_text.partition("::")
+            head_stripped = head.strip()
+            if head_stripped and len(head_stripped) < 200 and ":" in head_stripped:
+                leading_tags = head_stripped
+                remainder = rest
             else:
-                combined = prefix
+                leading_tags = ""
+                remainder = working_text
+
+            # Remaining segments: each introduced by a "::tags::" block
+            # (delimiters on BOTH sides). Scanned manually (not
+            # _INLINE_MARKER_RE.split()) so a match whose inner content
+            # doesn't look like a real tag list (no ':' in it -- e.g. a
+            # literal "::" a user typed as punctuation) is left as literal
+            # text instead of being force-split into a bogus segment.
+            pieces = []
+            last_end = 0
+            for m in _INLINE_MARKER_RE.finditer(remainder):
+                candidate = m.group(1).strip()
+                if not candidate or len(candidate) >= 200 or ":" not in candidate:
+                    continue
+                pieces.append(remainder[last_end:m.start()])
+                pieces.append(candidate)
+                last_end = m.end()
+            pieces.append(remainder[last_end:])
+            combined_parts = [_apply_tags_after_first_word(leading_tags, pieces[0].strip())]
+            segments_log.append((leading_tags, pieces[0].strip()))
+            i = 1
+            while i < len(pieces):
+                seg_tags = pieces[i].strip()
+                seg_text = pieces[i + 1].strip() if i + 1 < len(pieces) else ""
+                combined_parts.append(_apply_tags_after_first_word(seg_tags, seg_text))
+                segments_log.append((seg_tags, seg_text))
+                i += 2
+            combined = " ".join(p for p in combined_parts if p)
+
         else:
             combined = working_text
+
         print(
             f"[HiggsV3TagBuilder] text={text!r} ignored_tags_input={ignored_tags_input!r} "
-            f"-> source={source!r} resolved_tags={tags!r} working_text={working_text!r} "
-            f"-> combined_text={combined!r}"
+            f"-> source={source!r} segments={segments_log!r} -> combined_text={combined!r}"
         )
         return (combined,)
 
