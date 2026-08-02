@@ -375,16 +375,52 @@ def _tags_to_prefix(tags: str) -> str:
     return prefix
 
 
-def _apply_tags_after_first_word(tags: str, speech_text: str) -> str:
+def _tag_categories(tags: str) -> set:
+    return {
+        raw.split(":", 1)[0].strip().lower()
+        for raw in re.split(r"[;,]", tags)
+        if raw.strip()
+    }
+
+
+def _apply_tags(tags: str, speech_text: str) -> str:
     """
-    Insert this segment's <|...|> tag prefix after the first word of
-    speech_text rather than before all of it -- see build()'s docstring for
-    why (Higgs v3 speaker-conditioning drift when a tag precedes every word
-    of the utterance). If speech_text has no tags, returned unchanged.
+    Place this segment's <|...|> tag prefix, with placement rule depending
+    on which tag category is present -- these turned out NOT to be uniform,
+    confirmed 2026-08-02 against a real job log where the node built exactly
+    the intended combined_text (verified via the [HiggsV3TagBuilder]
+    segments= debug line) but `style` tags were still perceptually ignored
+    while an `sfx` tag in the same message fired correctly:
+
+      - `style` -- per Higgs's own PROMPTING.md (quoted in
+        GRAYDIENT-COMPLETE-REFERENCE.md): "put at the start of the sentence;
+        it colors the whole sentence" -- this is a REGISTRATION requirement
+        (the tag doesn't apply at all if not at the literal start), distinct
+        from the emotion/cloning-drift issue below. Placed at position 0 of
+        the segment, not after word 1.
+      - `sfx` (segment containing ONLY sfx tags) -- per the same doc, "pair
+        each token with the matching onomatopoeia immediately after it" --
+        tag comes BEFORE its word, not after. Also position 0. (Previously
+        placed after the word instead, which happened to still fire in one
+        live test, but that's not what the docs describe and isn't a
+        placement to rely on.)
+      - `emotion` (and anything else, e.g. `prosody`) -- per
+        Saganaki22/Higgs_v3-TTS-ComfyUI issue #3: a tag before ANY word of
+        the utterance can override/drift zero-shot voice-clone conditioning.
+        This is a DIFFERENT failure mode than style's registration
+        requirement -- the maintainer's own documented fix (tag after word
+        1) is kept here for this category.
+
+    If speech_text has no tags, returned unchanged.
     """
     prefix = _tags_to_prefix(tags)
     if not prefix:
         return speech_text
+
+    categories = _tag_categories(tags)
+    if "style" in categories or categories == {"sfx"}:
+        return f"{prefix}{speech_text}"
+
     parts = speech_text.split(None, 1)
     if len(parts) == 2:
         first_word, rest = parts
@@ -483,7 +519,7 @@ class HiggsV3TagBuilder:
             tags = ",".join(m.strip() for m in bracket_matches if m.strip())
             working_text = _BRACKET_RE.sub("", text).strip()
             source = "[...] bracket groups in text"
-            combined = _apply_tags_after_first_word(tags, working_text)
+            combined = _apply_tags(tags, working_text)
             segments_log.append((tags, working_text))
 
         elif "::" in working_text:
@@ -519,13 +555,13 @@ class HiggsV3TagBuilder:
                 pieces.append(candidate)
                 last_end = m.end()
             pieces.append(remainder[last_end:])
-            combined_parts = [_apply_tags_after_first_word(leading_tags, pieces[0].strip())]
+            combined_parts = [_apply_tags(leading_tags, pieces[0].strip())]
             segments_log.append((leading_tags, pieces[0].strip()))
             i = 1
             while i < len(pieces):
                 seg_tags = pieces[i].strip()
                 seg_text = pieces[i + 1].strip() if i + 1 < len(pieces) else ""
-                combined_parts.append(_apply_tags_after_first_word(seg_tags, seg_text))
+                combined_parts.append(_apply_tags(seg_tags, seg_text))
                 segments_log.append((seg_tags, seg_text))
                 i += 2
             combined = " ".join(p for p in combined_parts if p)
