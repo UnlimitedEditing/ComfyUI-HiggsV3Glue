@@ -279,6 +279,16 @@ class HiggsV3VoicePreset:
                 "custom_audio_url": ("STRING", {"default": ""}),
                 "custom_audio_url_alt": ("STRING", {"default": ""}),
                 "custom_audio_filename": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                # Deliberately "optional", not "required" -- ComfyUI's prompt
+                # validation demands every "required" input be explicitly
+                # present in the submitted API JSON regardless of whether the
+                # Python function has a default, so adding this as "required"
+                # broke every already-uploaded workflow with
+                # "Required input is missing: require_clone_source" (confirmed
+                # live 2026-08-02). "optional" inputs don't have that
+                # requirement -- the Python default below still applies.
                 "require_clone_source": ("BOOLEAN", {
                     "default": False,
                     "tooltip": (
@@ -289,7 +299,7 @@ class HiggsV3VoicePreset:
                         "succeeded."
                     ),
                 }),
-            }
+            },
         }
 
     RETURN_TYPES = ("AUDIO",)
