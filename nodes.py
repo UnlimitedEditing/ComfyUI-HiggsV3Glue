@@ -364,24 +364,30 @@ class HiggsV3TagBuilder:
     sad", meaning the frontend stripped the tag delimiters and left literal
     leftover text).
 
-    Three ways to supply tags, tried in this priority order:
-      1. `tags` input, if non-empty (bracket-free "key:value" list, e.g.
-         "emotion:sad;style:whispering"). Kept for completeness, but per
-         Graydient's own API response for this workflow, a `local_field:
-         "prompt_positive"` entry gets auto-synthesized (not something we
-         configured -- likely triggered by `split_prompt_pos_neg: true`) that
-         targets the SAME node input slot as `tags` and silently overwrites
-         it -- confirmed 2026-07-29 via `graydient workflows show`. Don't
-         assume this path is live; verify against a fresh `workflows show`
-         if depending on it.
-      2. `[...]` square-bracket groups found anywhere in `text` -- this is
+    Two ways to supply tags, tried in this priority order:
+      1. `[...]` square-bracket groups found anywhere in `text` -- this is
          Graydient's actual native negative-prompt syntax (confirmed via the
          graydient-cli docs: "there's no separate negative field over the raw
          API ... applied inline in the same string"). Each group's inner
          content is extracted, the group is removed from the spoken text, and
          multiple groups are joined with commas as the tag list.
-      3. A `tags::speech` marker at the start of `text` (own convention, not
-         a Graydient one) -- kept as a last-resort fallback.
+      2. A `tags::speech` marker at the start of `text` (own convention, not
+         a Graydient one) -- the confirmed-reliable path in real Graydient
+         testing.
+
+    The `tags` external input (previously fed by `negative_prompt`) has been
+    REMOVED as a tag source entirely -- confirmed live 2026-08-02 as a dead
+    end that never actually delivered a usable value ("negative_prompt ->
+    TagBuilder.tags STILL doesn't apply tags... confirmed dead end", per
+    gen_higgs_v2.py's own history), yet still being checked FIRST meant that
+    whenever Graydient populated that field with anything at all (even
+    unreliably/accidentally), steps 1/2 above were skipped -- so a `tags::`
+    marker typed directly in `text` was never stripped, and the literal
+    marker string got spoken aloud instead of being parsed as control tags.
+    A remaining `tags` kwarg is kept on `build()` for backward compatibility
+    with the field_mapping possibly still targeting this slot on an
+    already-uploaded workflow, but it is now ignored -- `text` is always
+    checked for `[...]` / `tags::` regardless of what's passed there.
 
     Tags are sentence-level only (Higgs v3's own style/emotion tags must sit
     at the start of the sentence they affect per the model card) -- this
@@ -407,16 +413,19 @@ class HiggsV3TagBuilder:
     CATEGORY = "Higgs v3 TTS"
 
     def build(self, text, tags=""):
-        tags = (tags or "").strip()
+        # `tags` (external input, previously fed by negative_prompt) is
+        # deliberately ignored -- see class docstring. text is always
+        # checked for [...] / tags:: regardless.
+        ignored_tags_input = (tags or "").strip()
+        tags = ""
         working_text = text
-        source = "tags input" if tags else None
+        source = None
 
-        if not tags:
-            bracket_matches = _BRACKET_RE.findall(text)
-            if bracket_matches:
-                tags = ",".join(m.strip() for m in bracket_matches if m.strip())
-                working_text = _BRACKET_RE.sub("", text).strip()
-                source = "[...] bracket groups in text"
+        bracket_matches = _BRACKET_RE.findall(text)
+        if bracket_matches:
+            tags = ",".join(m.strip() for m in bracket_matches if m.strip())
+            working_text = _BRACKET_RE.sub("", text).strip()
+            source = "[...] bracket groups in text"
 
         if not tags and "::" in working_text:
             marker_part, _, rest = working_text.partition("::")
@@ -435,7 +444,7 @@ class HiggsV3TagBuilder:
 
         combined = prefix + working_text
         print(
-            f"[HiggsV3TagBuilder] text={text!r} tags_input={tags if source == 'tags input' else ''!r} "
+            f"[HiggsV3TagBuilder] text={text!r} ignored_tags_input={ignored_tags_input!r} "
             f"-> source={source!r} resolved_tags={tags!r} working_text={working_text!r} "
             f"-> combined_text={combined!r}"
         )
