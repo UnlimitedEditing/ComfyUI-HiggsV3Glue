@@ -377,7 +377,12 @@ _BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
 # excluding ':' from the capture, an earlier version of this regex, meant it
 # could never match real tag content at all). Non-greedy so it stops at the
 # NEAREST following "::", not the last one in the message.
-_INLINE_MARKER_RE = re.compile(r"::(.+?)::")
+# "::::" (exactly four colons) is an EMPTY tag block: a segment break that
+# applies no tags, e.g. "sfx:burping:: Burp :::: haha, oops ::sfx:sniff:: Sff".
+# Without this alternative, "::::" + following text was read as a bogus tag
+# block ":: haha, oops" (live failure 2026-11-21) and every later tag was
+# spoken as literal text. Must come first so it wins at the same position.
+_INLINE_MARKER_RE = re.compile(r"(?<!:)::::(?!:)|::(.+?)::")
 
 
 def _tags_to_prefix(tags: str) -> str:
@@ -562,9 +567,12 @@ class HiggsV3TagBuilder:
             pieces = []
             last_end = 0
             for m in _INLINE_MARKER_RE.finditer(remainder):
-                candidate = m.group(1).strip()
-                if not candidate or len(candidate) >= 200 or ":" not in candidate:
-                    continue
+                if m.group(1) is None:
+                    candidate = ""  # "::::" empty tag block -> untagged segment
+                else:
+                    candidate = m.group(1).strip()
+                    if not candidate or len(candidate) >= 200 or ":" not in candidate:
+                        continue
                 pieces.append(remainder[last_end:m.start()])
                 pieces.append(candidate)
                 last_end = m.end()
