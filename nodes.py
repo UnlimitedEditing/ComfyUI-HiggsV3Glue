@@ -112,8 +112,22 @@ def _decode_audio_via_ffmpeg(path: str, sample_rate: int = HIGGS_SAMPLE_RATE):
     import numpy as np
     import torch
 
+    import shutil
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if ffmpeg_exe is None:
+        # Some Graydient runner images (seen 2026-11-21, tls-pro-ny10-g0, py 3.12.13)
+        # have no system ffmpeg. imageio-ffmpeg (pip) bundles a static binary.
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            raise RuntimeError(
+                "No ffmpeg on PATH and imageio-ffmpeg is not installed "
+                "(add 'imageio-ffmpeg' to the workflow pip list)"
+            ) from e
+
     cmd = [
-        "ffmpeg", "-v", "error", "-i", path,
+        ffmpeg_exe, "-v", "error", "-i", path,
         "-f", "s16le", "-acodec", "pcm_s16le",
         "-ar", str(sample_rate), "-ac", "1", "-",
     ]
